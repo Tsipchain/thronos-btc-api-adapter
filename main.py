@@ -41,10 +41,17 @@ UPSTREAMS: List[str] = [u.rstrip("/") for u in os.getenv("UPSTREAMS", "https://b
 CACHE_TTL: int = int(os.getenv("CACHE_TTL", "30"))
 RATE_LIMIT_RPS: float = float(os.getenv("RATE_LIMIT_RPS", "5"))
 
-# Allow all origins by default for CORS; adjust as needed when deploying
+# CORS origins — restricted to known Thronos domains by default.
+# In development you can set CORS_ORIGINS env var to override, e.g.:
+#   CORS_ORIGINS=http://localhost:3000,http://localhost:8080
+CORS_ORIGINS: List[str] = os.getenv(
+    "CORS_ORIGINS",
+    "https://api.thronoschain.org,https://commerce.thronoschain.org,https://explorer.thronoschain.org"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
