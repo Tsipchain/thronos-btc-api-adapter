@@ -40,8 +40,10 @@ equivalent routes of the Blockstream API:
 | `GET /api/block-height/{height}` | Returns the block hash at the given height. |
 | `GET /api/block/{block_hash}` | Returns details for a block by its hash. |
 | `GET /api/tx/{txid}` | Returns transaction details for a given TXID. |
+| `GET /api/address/{address}` | Returns details for an address (balance, tx count, etc.). |
 | `GET /api/address/{address}/utxo` | Returns the list of unspent outputs for the given address. |
-| `GET /api/address/{address}/txs` | Returns a list of transactions for the given address. |
+| `GET /api/address/{address}/txs` | Returns a list of transactions for the given address (both confirmed and unconfirmed). |
+| `GET /api/address/{address}/txs/mempool` | Returns unconfirmed transactions in the mempool for the given address. |
 
 ### Notes
 

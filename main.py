@@ -191,12 +191,30 @@ async def get_utxo(address: str) -> Any:
     return data
 
 
+@app.get("/api/address/{address}")
+async def get_address(address: str) -> Any:
+    """Return address details including balance and transaction counts."""
+    async def fetch(addr: str):
+        return await _fetch_from_upstreams(f"/address/{addr}")
+    data = await _get_cached_or_fetch("address", fetch, address)
+    return data
+
+
 @app.get("/api/address/{address}/txs")
 async def get_address_txs(address: str) -> Any:
     """Return the transaction list for the given address."""
     async def fetch(addr: str):
         return await _fetch_from_upstreams(f"/address/{addr}/txs")
     data = await _get_cached_or_fetch("address_txs", fetch, address)
+    return data
+
+
+@app.get("/api/address/{address}/txs/mempool")
+async def get_address_mempool_txs(address: str) -> Any:
+    """Return unconfirmed transactions in mempool for the given address."""
+    async def fetch(addr: str):
+        return await _fetch_from_upstreams(f"/address/{addr}/txs/mempool")
+    data = await _get_cached_or_fetch("address_mempool", fetch, address)
     return data
 
 
