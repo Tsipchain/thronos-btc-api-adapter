@@ -92,6 +92,20 @@ class TrustedStore:
         self._sequence = seq
         return True
 
+    def commit(self, seq: int, items: dict[str, Any]) -> bool:
+        """Atomically advance the sequence and publish a validated batch."""
+        if seq <= self._sequence:
+            return False
+        now = time.time()
+        self._sequence = seq
+        for key, value in items.items():
+            self._data[key] = CacheEntry(value, SOURCE_NODE_AGENT, now)
+        self._last_seen = now
+        while len(self._data) > self._max_entries:
+            oldest_key = next(iter(self._data))
+            del self._data[oldest_key]
+        return True
+
     def put(self, key: str, value: Any) -> None:
         self._data[key] = CacheEntry(value, SOURCE_NODE_AGENT, time.time())
         self._last_seen = time.time()
