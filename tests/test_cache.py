@@ -124,3 +124,36 @@ class TestTrustedStore:
         val = s.get_tip_height()
         assert isinstance(val, int)
         assert val == 870000
+
+    def test_bounded_max_entries(self):
+        s = TrustedStore(stale_seconds=60, max_entries=5)
+        for i in range(10):
+            s.put(f"key_{i}", i)
+        count = sum(1 for i in range(10) if s.get(f"key_{i}") is not None)
+        assert count <= 5
+
+    def test_sequence_monotonic(self):
+        s = TrustedStore(stale_seconds=60)
+        assert s.sequence == 0
+        assert s.advance_sequence(1) is True
+        assert s.sequence == 1
+        assert s.advance_sequence(5) is True
+        assert s.sequence == 5
+
+    def test_sequence_rejects_stale(self):
+        s = TrustedStore(stale_seconds=60)
+        s.advance_sequence(10)
+        assert s.advance_sequence(10) is False
+        assert s.advance_sequence(5) is False
+        assert s.sequence == 10
+
+    def test_sequence_rejects_zero(self):
+        s = TrustedStore(stale_seconds=60)
+        s.advance_sequence(1)
+        assert s.advance_sequence(0) is False
+
+    def test_clear_resets_sequence(self):
+        s = TrustedStore(stale_seconds=60)
+        s.advance_sequence(42)
+        s.clear()
+        assert s.sequence == 0

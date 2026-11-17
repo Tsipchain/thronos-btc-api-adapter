@@ -3,7 +3,15 @@
 import pytest
 from fastapi import HTTPException
 
-from validators import validate_address, validate_block_hash, validate_height, validate_txid
+from validators import (
+    validate_address,
+    validate_block_hash,
+    validate_block_hash_value,
+    validate_height,
+    validate_txid,
+    validate_ingest_key,
+    validate_ingest_value,
+)
 
 
 class TestValidateBlockHash:
@@ -25,10 +33,14 @@ class TestValidateBlockHash:
             validate_block_hash("a" * 65)
         assert exc_info.value.status_code == 400
 
-    def test_non_hex(self):
+    def test_non_hex_64_chars(self):
         with pytest.raises(HTTPException) as exc_info:
             validate_block_hash("g" * 64)
         assert exc_info.value.status_code == 400
+
+    def test_mixed_invalid_64_chars(self):
+        with pytest.raises(HTTPException):
+            validate_block_hash("abcdef0123456789" * 3 + "ZZZZZZZZZZZZZZZZ")
 
     def test_path_traversal(self):
         with pytest.raises(HTTPException) as exc_info:
@@ -42,6 +54,28 @@ class TestValidateBlockHash:
     def test_slash_injection(self):
         with pytest.raises(HTTPException):
             validate_block_hash("a" * 32 + "/../../" + "a" * 25)
+
+
+class TestValidateBlockHashValue:
+    def test_valid(self):
+        h = "a" * 64
+        assert validate_block_hash_value(h) == h
+
+    def test_64_non_hex(self):
+        assert validate_block_hash_value("z" * 64) is None
+
+    def test_short(self):
+        assert validate_block_hash_value("abcdef") is None
+
+    def test_long(self):
+        assert validate_block_hash_value("a" * 65) is None
+
+    def test_mixed_invalid(self):
+        assert validate_block_hash_value("0123456789abcdef" * 3 + "GHIJKLMNOPQRSTUV") is None
+
+    def test_normalizes_to_lower(self):
+        h = "A" * 64
+        assert validate_block_hash_value(h) == "a" * 64
 
 
 class TestValidateTxid:
@@ -113,3 +147,74 @@ class TestValidateAddress:
     def test_empty(self):
         with pytest.raises(HTTPException):
             validate_address("")
+
+
+class TestValidateIngestKey:
+    def test_allowed_exact_keys(self):
+        for key in ("tip_height", "tip_hash", "mempool_info", "chain_info"):
+            assert validate_ingest_key(key) == key
+
+    def test_allowed_prefixed_block_height(self):
+        assert validate_ingest_key("block_height:870000") == "block_height:870000"
+
+    def test_allowed_prefixed_block(self):
+        h = "a" * 64
+        assert validate_ingest_key(f"block:{h}") == f"block:{h}"
+
+    def test_allowed_prefixed_tx(self):
+        h = "b" * 64
+        assert validate_ingest_key(f"tx:{h}") == f"tx:{h}"
+
+    def test_reject_arbitrary_key(self):
+        assert validate_ingest_key("some_random_key") is None
+
+    def test_reject_too_long(self):
+        assert validate_ingest_key("a" * 257) is None
+
+    def test_reject_non_string(self):
+        assert validate_ingest_key(123) is None
+
+    def test_reject_invalid_prefix_suffix(self):
+        assert validate_ingest_key("block:not-a-hash") is None
+
+    def test_reject_block_height_non_numeric(self):
+        assert validate_ingest_key("block_height:abc") is None
+
+
+class TestValidateIngestValue:
+    def test_tip_height_valid(self):
+        ok, val = validate_ingest_value("tip_height", 870000)
+        assert ok is True
+        assert val == 870000
+
+    def test_tip_height_negative(self):
+        ok, _ = validate_ingest_value("tip_height", -1)
+        assert ok is False
+
+    def test_tip_height_string(self):
+        ok, val = validate_ingest_value("tip_height", "870000")
+        assert ok is True
+        assert val == 870000
+
+    def test_tip_hash_valid(self):
+        ok, val = validate_ingest_value("tip_hash", "A" * 64)
+        assert ok is True
+        assert val == "a" * 64
+
+    def test_tip_hash_invalid(self):
+        ok, _ = validate_ingest_value("tip_hash", "not-hex")
+        assert ok is False
+
+    def test_block_height_value_valid(self):
+        ok, val = validate_ingest_value("block_height:870000", "a" * 64)
+        assert ok is True
+        assert val == "a" * 64
+
+    def test_block_height_value_invalid(self):
+        ok, _ = validate_ingest_value("block_height:870000", "not-hex")
+        assert ok is False
+
+    def test_passthrough_for_other_keys(self):
+        ok, val = validate_ingest_value("chain_info", {"chain": "main"})
+        assert ok is True
+        assert val == {"chain": "main"}

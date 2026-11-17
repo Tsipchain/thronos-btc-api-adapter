@@ -1,31 +1,28 @@
 """Tests for the FastAPI application endpoints."""
 
+import time
 import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient, ASGITransport
 
 from main import app, _cache, _trusted, NODE_AGENT_TOKEN
+import main as main_module
 
 
 @pytest.fixture(autouse=True)
 def reset_state():
     _cache.clear()
     _trusted.clear()
+    main_module._last_upstream_tip = None
     yield
     _cache.clear()
     _trusted.clear()
+    main_module._last_upstream_tip = None
 
 
 @pytest.fixture
 def transport():
     return ASGITransport(app=app)
-
-
-@pytest.fixture
-def agent_headers():
-    if NODE_AGENT_TOKEN:
-        return {"X-Node-Agent-Token": NODE_AGENT_TOKEN}
-    return {"X-Node-Agent-Token": "test-token-for-ci"}
 
 
 # ---------- Health ----------
@@ -37,7 +34,7 @@ async def test_health_returns_ok(transport):
         resp = await ac.get("/api/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] in ("ok", "degraded")
+    assert body["status"] in ("ok", "degraded", "conflict")
     assert "node_agent" in body
     assert "upstreams" in body
     assert "cache" in body
@@ -53,6 +50,14 @@ async def test_health_no_credentials_leaked(transport):
     assert "token" not in text
     assert "secret" not in text
     assert "rpcuser" not in text
+
+
+@pytest.mark.anyio
+async def test_health_shows_sequence(transport):
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/health")
+    body = resp.json()
+    assert "sequence" in body["node_agent"]
 
 
 # ---------- Validators on public endpoints ----------
@@ -113,40 +118,100 @@ async def test_invalid_address_txs_rejected(transport):
 @pytest.mark.anyio
 async def test_node_agent_ingest_requires_auth(transport):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.post("/api/node-agent/ingest", json={"tip_height": 870000})
+        resp = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 1, "tip_height": 870000},
+        )
     assert resp.status_code == 401
 
 
 @pytest.mark.anyio
 async def test_node_agent_tip_requires_auth(transport):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.post("/api/node-agent/tip", json={"height": 870000})
+        resp = await ac.post("/api/node-agent/tip", json={"sequence": 1, "height": 870000})
     assert resp.status_code == 401
+
+
+# ---------- Node agent ingest schema ----------
 
 
 @pytest.mark.anyio
 @patch("main.NODE_AGENT_TOKEN", "test-secret-token")
-async def test_node_agent_ingest_accepts_valid_token(transport):
+async def test_ingest_accepts_valid_namespaces(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    payload = {
+        "sequence": 1,
+        "tip_height": 870000,
+        "tip_hash": "a" * 64,
+        "block_height:870000": "b" * 64,
+    }
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post("/api/node-agent/ingest", json=payload, headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] == 3
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_ingest_rejects_arbitrary_keys(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    payload = {
+        "sequence": 1,
+        "arbitrary_key": "should_be_rejected",
+        "another_random": 42,
+    }
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post("/api/node-agent/ingest", json=payload, headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] == 0
+    assert "arbitrary_key" in body["rejected"]
+    assert "another_random" in body["rejected"]
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_ingest_validates_values(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    payload = {
+        "sequence": 1,
+        "tip_height": "not-a-number",
+        "tip_hash": "too-short",
+    }
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post("/api/node-agent/ingest", json=payload, headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] == 0
+    assert len(body["rejected"]) == 2
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_ingest_requires_sequence(transport):
     headers = {"X-Node-Agent-Token": "test-secret-token"}
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.post(
             "/api/node-agent/ingest",
-            json={"tip_height": 870000, "tip_hash": "abc123"},
+            json={"tip_height": 870000},
             headers=headers,
         )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["accepted"] == 2
+    assert resp.status_code == 400
+    assert "sequence" in resp.json()["detail"].lower()
+
+
+# ---------- Node agent tip endpoint ----------
 
 
 @pytest.mark.anyio
 @patch("main.NODE_AGENT_TOKEN", "test-secret-token")
-async def test_node_agent_tip_push(transport):
+async def test_tip_push_valid(transport):
     headers = {"X-Node-Agent-Token": "test-secret-token"}
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.post(
             "/api/node-agent/tip",
-            json={"height": 870123, "hash": "a" * 64},
+            json={"sequence": 1, "height": 870123, "hash": "a" * 64},
             headers=headers,
         )
     assert resp.status_code == 200
@@ -155,15 +220,197 @@ async def test_node_agent_tip_push(transport):
 
 @pytest.mark.anyio
 @patch("main.NODE_AGENT_TOKEN", "test-secret-token")
-async def test_node_agent_bad_hash_rejected(transport):
+async def test_tip_push_requires_sequence(transport):
     headers = {"X-Node-Agent-Token": "test-secret-token"}
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.post(
             "/api/node-agent/tip",
-            json={"height": 870123, "hash": "too-short"},
+            json={"height": 870000, "hash": "a" * 64},
             headers=headers,
         )
     assert resp.status_code == 400
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_tip_hash_64_non_hex_rejected(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 1, "height": 870000, "hash": "z" * 64},
+            headers=headers,
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_tip_hash_short_rejected(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 1, "hash": "abcdef"},
+            headers=headers,
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_tip_hash_long_rejected(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 1, "hash": "a" * 65},
+            headers=headers,
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_tip_hash_mixed_invalid_rejected(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    bad_hash = "0123456789abcdef" * 3 + "GHIJKLMNOPQRSTUV"
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 1, "hash": bad_hash},
+            headers=headers,
+        )
+    assert resp.status_code == 400
+
+
+# ---------- Sequence / replay protection ----------
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_replay_rejected_on_ingest(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp1 = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 5, "tip_height": 870000},
+            headers=headers,
+        )
+        assert resp1.status_code == 200
+
+        resp2 = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 5, "tip_height": 870001},
+            headers=headers,
+        )
+        assert resp2.status_code == 409
+
+        resp3 = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 3, "tip_height": 870002},
+            headers=headers,
+        )
+        assert resp3.status_code == 409
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_replay_rejected_on_tip(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp1 = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 10, "height": 870000},
+            headers=headers,
+        )
+        assert resp1.status_code == 200
+
+        resp2 = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 10, "height": 870001},
+            headers=headers,
+        )
+        assert resp2.status_code == 409
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_replay_does_not_refresh_trusted_data(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 5, "tip_height": 870000},
+            headers=headers,
+        )
+        original_tip = _trusted.get_tip_height()
+        assert original_tip == 870000
+
+        resp = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 3, "tip_height": 999999},
+            headers=headers,
+        )
+        assert resp.status_code == 409
+        assert _trusted.get_tip_height() == 870000
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_forward_sequence_accepted(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp1 = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 1, "height": 870000},
+            headers=headers,
+        )
+        assert resp1.status_code == 200
+
+        resp2 = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 2, "height": 870001},
+            headers=headers,
+        )
+        assert resp2.status_code == 200
+        assert _trusted.get_tip_height() == 870001
+
+
+# ---------- Trusted data TTL ----------
+
+
+@pytest.mark.anyio
+async def test_trusted_data_does_not_extend_via_cache(transport):
+    """Trusted data must expire per NODE_AGENT_STALE_SECONDS, not get
+    re-cached with a fresh generic-cache timestamp."""
+    s = TrustedStore(stale_seconds=0.05)
+    s.put("tip_height", 870000)
+    s.advance_sequence(1)
+
+    entry = s.get("tip_height")
+    assert entry is not None
+
+    time.sleep(0.06)
+    assert s.get("tip_height") is None
+
+
+from cache import TrustedStore
+
+
+@pytest.mark.anyio
+async def test_resolve_does_not_recache_trusted(transport):
+    """When _resolve returns trusted data, it should NOT put it
+    in the generic cache."""
+    _trusted.put("tip_height", 870555)
+    _trusted.advance_sequence(1)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/blocks/tip/height")
+    assert resp.status_code == 200
+    assert resp.json() == 870555
+
+    assert _cache.get("tip_height") is None
 
 
 # ---------- Source priority ----------
@@ -172,18 +419,20 @@ async def test_node_agent_bad_hash_rejected(transport):
 @pytest.mark.anyio
 async def test_trusted_data_served_before_upstream(transport):
     _trusted.put("tip_height", 870999)
+    _trusted.advance_sequence(1)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/api/blocks/tip/height")
     assert resp.status_code == 200
     assert resp.json() == 870999
 
 
-# ---------- Tip status / conflict ----------
+# ---------- Conflict policy on reads ----------
 
 
 @pytest.mark.anyio
 async def test_tip_status_no_conflict(transport):
     _trusted.put("tip_height", 870000)
+    _trusted.advance_sequence(1)
     with patch("main._fetch_from_upstreams", new_callable=AsyncMock, return_value="870001"):
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             resp = await ac.get("/api/tip/status")
@@ -196,11 +445,67 @@ async def test_tip_status_no_conflict(transport):
 @pytest.mark.anyio
 async def test_tip_status_conflict_returns_503(transport):
     _trusted.put("tip_height", 870000)
+    _trusted.advance_sequence(1)
     with patch("main._fetch_from_upstreams", new_callable=AsyncMock, return_value="870010"):
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             resp = await ac.get("/api/tip/status")
     assert resp.status_code == 503
     assert "conflict" in resp.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_conflict_blocks_block_height_read(transport):
+    """When tip conflict exists, block-height read returns 503."""
+    _trusted.put("tip_height", 870000)
+    _trusted.advance_sequence(1)
+    main_module._last_upstream_tip = 870020
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/block-height/870000")
+    assert resp.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_conflict_blocks_block_read(transport):
+    _trusted.put("tip_height", 870000)
+    _trusted.advance_sequence(1)
+    main_module._last_upstream_tip = 870020
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/block/" + "a" * 64)
+    assert resp.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_conflict_blocks_tx_read(transport):
+    _trusted.put("tip_height", 870000)
+    _trusted.advance_sequence(1)
+    main_module._last_upstream_tip = 870020
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/tx/" + "b" * 64)
+    assert resp.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_conflict_blocks_tip_height_read(transport):
+    _trusted.put("tip_height", 870000)
+    _trusted.advance_sequence(1)
+    main_module._last_upstream_tip = 870020
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/blocks/tip/height")
+    assert resp.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_no_conflict_when_only_upstream(transport):
+    """When no trusted tip, there is no conflict — upstream serves normally."""
+    main_module._last_upstream_tip = 870000
+    with patch("main._fetch_from_upstreams", new_callable=AsyncMock, return_value="870000"):
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/blocks/tip/height")
+    assert resp.status_code == 200
 
 
 # ---------- CORS ----------

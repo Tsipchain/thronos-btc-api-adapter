@@ -58,16 +58,26 @@ class BoundedCache:
 
 
 class TrustedStore:
-    """Separate store for node-agent pushed data with its own staleness TTL."""
+    """Separate store for node-agent pushed data with its own staleness TTL.
 
-    def __init__(self, stale_seconds: float = 120.0):
+    Supports monotonic sequence enforcement: updates with a sequence number
+    at or below the current high-water mark are rejected as stale/replayed.
+    """
+
+    def __init__(self, stale_seconds: float = 120.0, max_entries: int = 5000):
         self._data: dict[str, CacheEntry] = {}
         self._stale_seconds = stale_seconds
+        self._max_entries = max(1, max_entries)
         self._last_seen: float = 0.0
+        self._sequence: int = 0
 
     @property
     def last_seen(self) -> float:
         return self._last_seen
+
+    @property
+    def sequence(self) -> int:
+        return self._sequence
 
     @property
     def is_connected(self) -> bool:
@@ -75,9 +85,19 @@ class TrustedStore:
             return False
         return (time.time() - self._last_seen) < self._stale_seconds * 2
 
+    def advance_sequence(self, seq: int) -> bool:
+        """Try to advance to the given sequence. Returns False if stale/replay."""
+        if seq <= self._sequence:
+            return False
+        self._sequence = seq
+        return True
+
     def put(self, key: str, value: Any) -> None:
         self._data[key] = CacheEntry(value, SOURCE_NODE_AGENT, time.time())
         self._last_seen = time.time()
+        while len(self._data) > self._max_entries:
+            oldest_key = next(iter(self._data))
+            del self._data[oldest_key]
 
     def get(self, key: str) -> Optional[CacheEntry]:
         entry = self._data.get(key)
@@ -100,3 +120,4 @@ class TrustedStore:
     def clear(self) -> None:
         self._data.clear()
         self._last_seen = 0.0
+        self._sequence = 0

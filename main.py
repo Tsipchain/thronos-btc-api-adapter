@@ -5,15 +5,15 @@ Blockstream-compatible Bitcoin API proxy with:
 - Node-agent trusted data ingest (push from private bitcoind observer)
 - Source priority: node_agent > cache > external upstreams
 - Bounded LRU cache with provenance
-- Input validation on all path parameters
+- Input validation on all path parameters and ingest payloads
 - Conflict detection between trusted and upstream sources
+- Monotonic sequence enforcement on node-agent updates
 - Shared HTTP client pool
 """
 
 import os
 import time
 import asyncio
-import hashlib
 import hmac
 import logging
 from contextlib import asynccontextmanager
@@ -21,11 +21,20 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from cache import BoundedCache, TrustedStore, SOURCE_NODE_AGENT, SOURCE_UPSTREAM
-from validators import validate_address, validate_block_hash, validate_height, validate_txid
+from validators import (
+    validate_address,
+    validate_block_hash,
+    validate_block_hash_value,
+    validate_height,
+    validate_txid,
+    validate_ingest_key,
+    validate_ingest_value,
+    INGEST_MAX_BODY_BYTES,
+    INGEST_MAX_ITEMS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +53,7 @@ RATE_LIMIT_RPS: float = float(os.getenv("RATE_LIMIT_RPS", "5"))
 
 NODE_AGENT_TOKEN: str = os.getenv("NODE_AGENT_TOKEN", "")
 NODE_AGENT_STALE_SECONDS: float = float(os.getenv("NODE_AGENT_STALE_SECONDS", "120"))
+TRUSTED_MAX_ENTRIES: int = int(os.getenv("TRUSTED_MAX_ENTRIES", "5000"))
 
 TIP_CONFLICT_THRESHOLD: int = int(os.getenv("TIP_CONFLICT_THRESHOLD", "2"))
 
@@ -59,13 +69,15 @@ MAX_RESPONSE_BYTES: int = 16 * 1024 * 1024  # 16 MB
 # ---------------------------------------------------------------------------
 
 _cache = BoundedCache(max_entries=CACHE_MAX_ENTRIES, ttl=CACHE_TTL)
-_trusted = TrustedStore(stale_seconds=NODE_AGENT_STALE_SECONDS)
+_trusted = TrustedStore(stale_seconds=NODE_AGENT_STALE_SECONDS, max_entries=TRUSTED_MAX_ENTRIES)
 
 _http_client: Optional[httpx.AsyncClient] = None
 _last_request_time: float = 0.0
 _rate_lock = asyncio.Lock()
 
 _start_time: float = time.time()
+
+_last_upstream_tip: Optional[int] = None
 
 
 def _get_http_client() -> httpx.AsyncClient:
@@ -86,7 +98,7 @@ async def lifespan(app: FastAPI):
         await _http_client.aclose()
 
 
-app = FastAPI(title="Thronos BTC API Adapter", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Thronos BTC API Adapter", version="2.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,11 +149,38 @@ async def _rate_limit() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conflict policy
+# ---------------------------------------------------------------------------
+
+
+def _check_tip_conflict(trusted_tip: Optional[int], upstream_tip: Optional[int]) -> Optional[str]:
+    if trusted_tip is None or upstream_tip is None:
+        return None
+    diff = abs(trusted_tip - upstream_tip)
+    if diff > TIP_CONFLICT_THRESHOLD:
+        return f"Tip height conflict: node_agent={trusted_tip}, upstream={upstream_tip}, delta={diff}"
+    return None
+
+
+def _enforce_conflict_policy() -> None:
+    """Raise 503 if trusted and upstream tips are in conflict.
+
+    Called by every chain-data read endpoint so conflicting state
+    is never silently served.
+    """
+    trusted_tip = _trusted.get_tip_height()
+    conflict = _check_tip_conflict(trusted_tip, _last_upstream_tip)
+    if conflict:
+        raise HTTPException(status_code=503, detail=conflict)
+
+
+# ---------------------------------------------------------------------------
 # Source resolution
 # ---------------------------------------------------------------------------
 
 
 async def _fetch_from_upstreams(path: str) -> Any:
+    global _last_upstream_tip
     client = _get_http_client()
     for base in UPSTREAMS:
         url = f"{base}{path}"
@@ -154,9 +193,17 @@ async def _fetch_from_upstreams(path: str) -> Any:
                     continue
                 content_type = resp.headers.get("content-type", "")
                 if "application/json" in content_type:
-                    return resp.json()
+                    result = resp.json()
                 else:
-                    return resp.text
+                    result = resp.text
+
+                if path == "/blocks/tip/height":
+                    try:
+                        _last_upstream_tip = int(result if isinstance(result, str) else str(result))
+                    except (ValueError, TypeError):
+                        pass
+
+                return result
         except Exception as exc:
             logger.warning("Upstream %s failed: %s", url, exc)
             continue
@@ -164,10 +211,16 @@ async def _fetch_from_upstreams(path: str) -> Any:
 
 
 async def _resolve(cache_key: str, upstream_path: str) -> Any:
-    """Source priority: trusted node-agent > cache > upstream fallback."""
+    """Source priority: trusted node-agent > cache > upstream fallback.
+
+    Trusted entries are served directly without being copied into the
+    generic cache, so their lifetime is governed solely by
+    NODE_AGENT_STALE_SECONDS.
+    """
+    _enforce_conflict_policy()
+
     trusted_entry = _trusted.get(cache_key)
     if trusted_entry is not None:
-        _cache.put(cache_key, trusted_entry.value, SOURCE_NODE_AGENT)
         return trusted_entry.value
 
     cached = _cache.get(cache_key)
@@ -179,15 +232,6 @@ async def _resolve(cache_key: str, upstream_path: str) -> Any:
     return result
 
 
-def _check_tip_conflict(trusted_tip: Optional[int], upstream_tip: Optional[int]) -> Optional[str]:
-    if trusted_tip is None or upstream_tip is None:
-        return None
-    diff = abs(trusted_tip - upstream_tip)
-    if diff > TIP_CONFLICT_THRESHOLD:
-        return f"Tip height conflict: node_agent={trusted_tip}, upstream={upstream_tip}, delta={diff}"
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Node Agent ingest endpoints (POST, authenticated)
 # ---------------------------------------------------------------------------
@@ -195,25 +239,94 @@ def _check_tip_conflict(trusted_tip: Optional[int], upstream_tip: Optional[int])
 
 @app.post("/api/node-agent/ingest", dependencies=[Depends(require_node_agent)])
 async def node_agent_ingest(request: Request) -> Dict[str, Any]:
-    """Accept a batch of verified chain data from the node agent."""
-    body = await request.json()
+    """Accept a batch of verified chain data from the node agent.
+
+    Only keys matching allowed namespaces are accepted. Each key and
+    value is validated before insertion. A monotonic ``sequence`` field
+    is required; updates with a sequence at or below the current
+    high-water mark are rejected.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+
+    raw = await request.body()
+    if len(raw) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+
+    import json
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Body must be a JSON object")
 
+    seq = body.pop("sequence", None)
+    if seq is None:
+        raise HTTPException(status_code=400, detail="Missing required field: sequence")
+    try:
+        seq = int(seq)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="sequence must be an integer")
+
+    if not _trusted.advance_sequence(seq):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stale sequence {seq}; current high-water mark is {_trusted.sequence}",
+        )
+
+    if len(body) > INGEST_MAX_ITEMS:
+        raise HTTPException(status_code=400, detail=f"Batch exceeds {INGEST_MAX_ITEMS} items")
+
     accepted = 0
+    rejected_keys: list[str] = []
+
     for key, value in body.items():
-        if not isinstance(key, str) or len(key) > 256:
+        normalized_key = validate_ingest_key(key)
+        if normalized_key is None:
+            rejected_keys.append(key)
             continue
-        _trusted.put(key, value)
+
+        valid, normalized_value = validate_ingest_value(normalized_key, value)
+        if not valid:
+            rejected_keys.append(key)
+            continue
+
+        _trusted.put(normalized_key, normalized_value)
         accepted += 1
 
-    return {"accepted": accepted, "timestamp": time.time()}
+    result: Dict[str, Any] = {"accepted": accepted, "timestamp": time.time()}
+    if rejected_keys:
+        result["rejected"] = rejected_keys
+
+    return result
 
 
 @app.post("/api/node-agent/tip", dependencies=[Depends(require_node_agent)])
 async def node_agent_push_tip(request: Request) -> Dict[str, Any]:
-    """Accept tip height + hash from node agent. Triggers conflict check."""
+    """Accept tip height + hash from node agent with sequence enforcement."""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+
     body = await request.json()
+
+    seq = body.get("sequence")
+    if seq is None:
+        raise HTTPException(status_code=400, detail="Missing required field: sequence")
+    try:
+        seq = int(seq)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="sequence must be an integer")
+
+    if not _trusted.advance_sequence(seq):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stale sequence {seq}; current high-water mark is {_trusted.sequence}",
+        )
+
     height = body.get("height")
     block_hash = body.get("hash")
 
@@ -222,14 +335,19 @@ async def node_agent_push_tip(request: Request) -> Dict[str, Any]:
             height = int(height)
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="height must be an integer")
+        if height < 0 or height > 10_000_000:
+            raise HTTPException(status_code=400, detail="height out of range")
         _trusted.put("tip_height", height)
 
     if block_hash is not None:
-        if not isinstance(block_hash, str) or len(block_hash) != 64:
-            raise HTTPException(status_code=400, detail="hash must be 64 hex characters")
-        _trusted.put("tip_hash", block_hash.lower())
+        if not isinstance(block_hash, str):
+            raise HTTPException(status_code=400, detail="hash must be a string")
+        normalized = validate_block_hash_value(block_hash)
+        if normalized is None:
+            raise HTTPException(status_code=400, detail="hash must be exactly 64 hex characters")
+        _trusted.put("tip_hash", normalized)
         if height is not None:
-            _trusted.put(f"block_height:{height}", block_hash.lower())
+            _trusted.put(f"block_height:{height}", normalized)
 
     return {"accepted": True, "timestamp": time.time()}
 
@@ -241,39 +359,41 @@ async def node_agent_push_tip(request: Request) -> Dict[str, Any]:
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
+    global _last_upstream_tip
     upstreams_reachable = 0
+    upstream_tip = None
+
     for base in UPSTREAMS:
         try:
             client = _get_http_client()
             resp = await client.get(f"{base}/blocks/tip/height", timeout=5.0)
             if resp.status_code == 200:
                 upstreams_reachable += 1
+                if upstream_tip is None:
+                    try:
+                        upstream_tip = int(resp.text.strip())
+                        _last_upstream_tip = upstream_tip
+                    except (ValueError, TypeError):
+                        pass
         except Exception:
             pass
 
     trusted_tip = _trusted.get_tip_height()
-    upstream_tip = None
-    try:
-        for base in UPSTREAMS:
-            try:
-                client = _get_http_client()
-                resp = await client.get(f"{base}/blocks/tip/height", timeout=5.0)
-                if resp.status_code == 200:
-                    upstream_tip = int(resp.text.strip())
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
     conflict = _check_tip_conflict(trusted_tip, upstream_tip)
 
+    status = "ok"
+    if conflict:
+        status = "conflict"
+    elif not _trusted.is_connected and upstreams_reachable == 0:
+        status = "degraded"
+
     result: Dict[str, Any] = {
-        "status": "degraded" if conflict else "ok",
+        "status": status,
         "uptime_seconds": int(time.time() - _start_time),
         "node_agent": {
             "connected": _trusted.is_connected,
             "tip_height": trusted_tip,
+            "sequence": _trusted.sequence,
         },
         "upstreams": {
             "reachable": upstreams_reachable,
@@ -300,6 +420,8 @@ async def health() -> Dict[str, Any]:
 
 @app.get("/api/blocks/tip/height")
 async def get_tip_height() -> Union[int, str]:
+    _enforce_conflict_policy()
+
     trusted_tip = _trusted.get_tip_height()
     if trusted_tip is not None:
         return trusted_tip
