@@ -60,6 +60,11 @@ TRUSTED_MAX_ENTRIES: int = int(os.getenv("TRUSTED_MAX_ENTRIES", "5000"))
 TIP_CONFLICT_THRESHOLD: int = int(os.getenv("TIP_CONFLICT_THRESHOLD", "2"))
 
 BTC_DEPOSIT_DB_PATH: str = os.getenv("BTC_DEPOSIT_DB_PATH", "").strip()
+BTC_DEPOSIT_MIN_CONFIRMATIONS: int = int(
+    os.getenv("BTC_DEPOSIT_MIN_CONFIRMATIONS", "6")
+)
+if BTC_DEPOSIT_MIN_CONFIRMATIONS < 1 or BTC_DEPOSIT_MIN_CONFIRMATIONS > 10_000:
+    raise RuntimeError("BTC_DEPOSIT_MIN_CONFIRMATIONS out of range")
 
 CORS_ORIGINS: List[str] = os.getenv(
     "CORS_ORIGINS",
@@ -187,6 +192,11 @@ def _validate_deposit_payload(body: Any) -> Dict[str, Any]:
     minimum_confirmations = _strict_positive_int(
         body.get("minimum_confirmations"), "minimum_confirmations", maximum=10_000
     )
+    if minimum_confirmations < BTC_DEPOSIT_MIN_CONFIRMATIONS:
+        raise HTTPException(
+            status_code=409,
+            detail="Deposit confirmation policy is below the adapter minimum",
+        )
     if confirmations < minimum_confirmations:
         raise HTTPException(status_code=409, detail="Deposit is not final")
 

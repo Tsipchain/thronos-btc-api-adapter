@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sqlite3
 import tempfile
 
 import pytest
@@ -48,3 +50,69 @@ def test_same_key_different_payload_fails_closed():
         with pytest.raises(DepositStoreError, match="idempotency_conflict"):
             store.accept(changed)
         assert store.count() == 1
+
+
+def test_simultaneous_duplicate_delivery_is_deterministic():
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _index: store.accept(payload()), range(32)))
+        assert [result.status for result in results].count("accepted") == 1
+        assert [result.status for result in results].count("duplicate") == 31
+        assert store.count() == 1
+
+
+def test_simultaneous_conflicting_delivery_fails_closed():
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        changed = payload()
+        changed["amount_sats"] = 99999
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(store.accept, item) for item in (payload(), changed)]
+        accepted = 0
+        conflicts = 0
+        for future in futures:
+            try:
+                accepted += int(future.result().status == "accepted")
+            except DepositStoreError as exc:
+                assert str(exc) == "deposit_idempotency_conflict"
+                conflicts += 1
+        assert (accepted, conflicts) == (1, 1)
+        assert store.count() == 1
+
+
+def test_database_network_identity_is_durable():
+    with tempfile.TemporaryDirectory() as td:
+        path = str(Path(td) / "deposits.db")
+        DepositStore(path)
+        DepositStore(path)
+        with pytest.raises(DepositStoreError, match="network_identity_mismatch"):
+            DepositStore(path, network="test", genesis_hash="22" * 32)
+
+
+def test_pr4_database_is_safely_bound_during_additive_migration():
+    with tempfile.TemporaryDirectory() as td:
+        path = str(Path(td) / "deposits.db")
+        store = DepositStore(path)
+        store.accept(payload())
+        with sqlite3.connect(path) as con:
+            con.execute("DROP TABLE btc_deposit_store_identity")
+
+        reopened = DepositStore(path)
+        assert reopened.accept(payload()).status == "duplicate"
+        with sqlite3.connect(path) as con:
+            identity = con.execute(
+                """SELECT network, genesis_hash
+                   FROM btc_deposit_store_identity WHERE singleton=1"""
+            ).fetchone()
+        assert identity == ("main", MAINNET_GENESIS_HASH)
+
+
+def test_store_rejects_payload_from_another_network_identity():
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        changed = payload()
+        changed["genesis_hash"] = "22" * 32
+        with pytest.raises(DepositStoreError, match="network_identity_mismatch"):
+            store.accept(changed)
+        assert store.count() == 0
