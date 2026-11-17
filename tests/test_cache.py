@@ -157,3 +157,13 @@ class TestTrustedStore:
         s.advance_sequence(42)
         s.clear()
         assert s.sequence == 0
+
+
+def test_trusted_commit_is_all_or_nothing_for_sequence():
+    store = TrustedStore(stale_seconds=60, max_entries=10)
+    assert store.commit(5, {"tip_height": 100, "tip_hash": "a" * 64}) is True
+    assert store.sequence == 5
+    assert store.get_tip_height() == 100
+    assert store.commit(5, {"tip_height": 101}) is False
+    assert store.sequence == 5
+    assert store.get_tip_height() == 100
