@@ -1,11 +1,14 @@
 """Tests for the FastAPI application endpoints."""
 
 import time
+from pathlib import Path
+import tempfile
 import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient, ASGITransport
 
 from main import app, _cache, _trusted, NODE_AGENT_TOKEN
+from deposit_store import DepositStore, MAINNET_GENESIS_HASH
 import main as main_module
 
 
@@ -163,11 +166,10 @@ async def test_ingest_rejects_arbitrary_keys(transport):
     }
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.post("/api/node-agent/ingest", json=payload, headers=headers)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["accepted"] == 0
-    assert "arbitrary_key" in body["rejected"]
-    assert "another_random" in body["rejected"]
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "arbitrary_key" in detail["rejected"]
+    assert "another_random" in detail["rejected"]
 
 
 @pytest.mark.anyio
@@ -181,10 +183,9 @@ async def test_ingest_validates_values(transport):
     }
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.post("/api/node-agent/ingest", json=payload, headers=headers)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["accepted"] == 0
-    assert len(body["rejected"]) == 2
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert len(detail["rejected"]) == 2
 
 
 @pytest.mark.anyio
@@ -548,3 +549,141 @@ async def test_cache_respects_max_entries():
     for i in range(100):
         c.put(f"key_{i}", f"val_{i}", "upstream")
     assert c.size <= int(c._max_entries)
+
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_invalid_ingest_does_not_consume_sequence(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        bad = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 5, "tip_hash": "bad"},
+            headers=headers,
+        )
+        assert bad.status_code == 400
+        assert _trusted.sequence == 0
+
+        good = await ac.post(
+            "/api/node-agent/ingest",
+            json={"sequence": 5, "tip_height": 870000},
+            headers=headers,
+        )
+        assert good.status_code == 200
+        assert _trusted.sequence == 5
+        assert _trusted.get_tip_height() == 870000
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_invalid_tip_does_not_consume_sequence(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        bad = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 8, "height": -1, "hash": "a" * 64},
+            headers=headers,
+        )
+        assert bad.status_code == 400
+        assert _trusted.sequence == 0
+
+        good = await ac.post(
+            "/api/node-agent/tip",
+            json={"sequence": 8, "height": 870000, "hash": "a" * 64},
+            headers=headers,
+        )
+        assert good.status_code == 200
+        assert _trusted.sequence == 8
+
+
+def _deposit_payload():
+    txid = "11" * 32
+    return {
+        "network": "main",
+        "genesis_hash": MAINNET_GENESIS_HASH,
+        "event_id": f"main:{txid}:0",
+        "idempotency_key": f"main:{txid}:0",
+        "txid": txid,
+        "vout": 0,
+        "address": "bc1qtestaddress000000000000000000000000000",
+        "owner_ref": "bridge-intent-1",
+        "amount_sats": 25000,
+        "confirmations": 6,
+        "minimum_confirmations": 6,
+        "block_hash": "aa" * 32,
+        "block_height": 976310,
+        "requires_reconciliation": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_deposit_ingest_requires_auth(transport):
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post("/api/node-agent/deposits", json=_deposit_payload())
+    assert resp.status_code == 401
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_deposit_ingest_fails_closed_when_not_configured(transport, monkeypatch):
+    monkeypatch.setattr(main_module, "_deposit_store", None)
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post("/api/node-agent/deposits", json=_deposit_payload(), headers=headers)
+    assert resp.status_code == 503
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_deposit_ingest_is_durable_and_idempotent(transport, monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        monkeypatch.setattr(main_module, "_deposit_store", store)
+        headers = {"X-Node-Agent-Token": "test-secret-token"}
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            first = await ac.post("/api/node-agent/deposits", json=_deposit_payload(), headers=headers)
+            second = await ac.post("/api/node-agent/deposits", json=_deposit_payload(), headers=headers)
+        assert first.status_code == 200
+        assert first.json()["status"] == "accepted"
+        assert first.json()["credit_applied"] is False
+        assert second.status_code == 200
+        assert second.json()["status"] == "duplicate"
+        assert store.count() == 1
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_deposit_ingest_rejects_nonfinal_and_network_mismatch(transport, monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        monkeypatch.setattr(main_module, "_deposit_store", store)
+        headers = {"X-Node-Agent-Token": "test-secret-token"}
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            nonfinal = _deposit_payload()
+            nonfinal["confirmations"] = 5
+            resp = await ac.post("/api/node-agent/deposits", json=nonfinal, headers=headers)
+            assert resp.status_code == 409
+
+            wrong_network = _deposit_payload()
+            wrong_network["network"] = "test"
+            resp = await ac.post("/api/node-agent/deposits", json=wrong_network, headers=headers)
+            assert resp.status_code == 400
+        assert store.count() == 0
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_deposit_idempotency_conflict_returns_409(transport, monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        monkeypatch.setattr(main_module, "_deposit_store", store)
+        headers = {"X-Node-Agent-Token": "test-secret-token"}
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            first = await ac.post("/api/node-agent/deposits", json=_deposit_payload(), headers=headers)
+            assert first.status_code == 200
+            changed = _deposit_payload()
+            changed["amount_sats"] = 25001
+            conflict = await ac.post("/api/node-agent/deposits", json=changed, headers=headers)
+            assert conflict.status_code == 409
+        assert store.count() == 1
