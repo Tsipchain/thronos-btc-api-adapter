@@ -15,6 +15,7 @@ import os
 import time
 import asyncio
 import hmac
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Union
@@ -24,6 +25,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from cache import BoundedCache, TrustedStore, SOURCE_NODE_AGENT, SOURCE_UPSTREAM
+from deposit_store import DepositStore, DepositStoreError, MAINNET_GENESIS_HASH
 from validators import (
     validate_address,
     validate_block_hash,
@@ -57,6 +59,8 @@ TRUSTED_MAX_ENTRIES: int = int(os.getenv("TRUSTED_MAX_ENTRIES", "5000"))
 
 TIP_CONFLICT_THRESHOLD: int = int(os.getenv("TIP_CONFLICT_THRESHOLD", "2"))
 
+BTC_DEPOSIT_DB_PATH: str = os.getenv("BTC_DEPOSIT_DB_PATH", "").strip()
+
 CORS_ORIGINS: List[str] = os.getenv(
     "CORS_ORIGINS",
     "https://api.thronoschain.org,https://commerce.thronoschain.org,https://explorer.thronoschain.org",
@@ -70,6 +74,9 @@ MAX_RESPONSE_BYTES: int = 16 * 1024 * 1024  # 16 MB
 
 _cache = BoundedCache(max_entries=CACHE_MAX_ENTRIES, ttl=CACHE_TTL)
 _trusted = TrustedStore(stale_seconds=NODE_AGENT_STALE_SECONDS, max_entries=TRUSTED_MAX_ENTRIES)
+_deposit_store: Optional[DepositStore] = (
+    DepositStore(BTC_DEPOSIT_DB_PATH) if BTC_DEPOSIT_DB_PATH else None
+)
 
 _http_client: Optional[httpx.AsyncClient] = None
 _last_request_time: float = 0.0
@@ -98,7 +105,7 @@ async def lifespan(app: FastAPI):
         await _http_client.aclose()
 
 
-app = FastAPI(title="Thronos BTC API Adapter", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="Thronos BTC API Adapter", version="2.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,6 +135,101 @@ async def require_node_agent(
         token = authorization[7:]
     if not token or not _verify_node_agent_token(token):
         raise HTTPException(status_code=401, detail="Invalid or missing node agent token")
+
+
+def _strict_nonnegative_int(value: Any, field: str, *, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(status_code=400, detail=f"{field} must be an integer")
+    if value < 0 or value > maximum:
+        raise HTTPException(status_code=400, detail=f"{field} out of range")
+    return value
+
+
+def _strict_positive_int(value: Any, field: str, *, maximum: int) -> int:
+    parsed = _strict_nonnegative_int(value, field, maximum=maximum)
+    if parsed <= 0:
+        raise HTTPException(status_code=400, detail=f"{field} must be positive")
+    return parsed
+
+
+def _bounded_text(value: Any, field: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"{field} must be a string")
+    result = value.strip()
+    if not result or len(result) > maximum:
+        raise HTTPException(status_code=400, detail=f"{field} invalid")
+    return result
+
+
+def _validate_deposit_payload(body: Any) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    network = _bounded_text(body.get("network"), "network", 16)
+    if network != "main":
+        raise HTTPException(status_code=400, detail="Only Bitcoin mainnet deposits are accepted")
+
+    genesis_hash = validate_block_hash_value(body.get("genesis_hash"))
+    if genesis_hash != MAINNET_GENESIS_HASH:
+        raise HTTPException(status_code=400, detail="Bitcoin network identity mismatch")
+
+    txid = validate_block_hash_value(body.get("txid"))
+    if txid is None:
+        raise HTTPException(status_code=400, detail="txid must be exactly 64 hex characters")
+
+    vout = _strict_nonnegative_int(body.get("vout"), "vout", maximum=10_000_000)
+    amount_sats = _strict_positive_int(
+        body.get("amount_sats"), "amount_sats", maximum=2_100_000_000_000_000
+    )
+    confirmations = _strict_nonnegative_int(
+        body.get("confirmations"), "confirmations", maximum=10_000_000
+    )
+    minimum_confirmations = _strict_positive_int(
+        body.get("minimum_confirmations"), "minimum_confirmations", maximum=10_000
+    )
+    if confirmations < minimum_confirmations:
+        raise HTTPException(status_code=409, detail="Deposit is not final")
+
+    block_hash = validate_block_hash_value(body.get("block_hash"))
+    if block_hash is None:
+        raise HTTPException(status_code=400, detail="block_hash must be exactly 64 hex characters")
+    block_height = _strict_nonnegative_int(
+        body.get("block_height"), "block_height", maximum=10_000_000
+    )
+
+    address = _bounded_text(body.get("address"), "address", 128)
+    owner_ref = _bounded_text(body.get("owner_ref"), "owner_ref", 200)
+
+    if body.get("requires_reconciliation") is not False:
+        raise HTTPException(status_code=409, detail="Deposit requires reconciliation")
+
+    event_id = _bounded_text(body.get("event_id"), "event_id", 160)
+    expected_event_id = f"{network}:{txid}:{vout}"
+    if event_id != expected_event_id:
+        raise HTTPException(status_code=400, detail="event_id does not match network:txid:vout")
+
+    idempotency_key = _bounded_text(
+        body.get("idempotency_key"), "idempotency_key", 160
+    )
+    if idempotency_key != expected_event_id:
+        raise HTTPException(status_code=400, detail="idempotency_key mismatch")
+
+    return {
+        "network": network,
+        "genesis_hash": genesis_hash,
+        "event_id": event_id,
+        "idempotency_key": idempotency_key,
+        "txid": txid,
+        "vout": vout,
+        "address": address,
+        "owner_ref": owner_ref,
+        "amount_sats": amount_sats,
+        "confirmations": confirmations,
+        "minimum_confirmations": minimum_confirmations,
+        "block_hash": block_hash,
+        "block_height": block_height,
+        "requires_reconciliation": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +341,7 @@ async def _resolve(cache_key: str, upstream_path: str) -> Any:
 
 @app.post("/api/node-agent/ingest", dependencies=[Depends(require_node_agent)])
 async def node_agent_ingest(request: Request) -> Dict[str, Any]:
-    """Accept a batch of verified chain data from the node agent.
-
-    Only keys matching allowed namespaces are accepted. Each key and
-    value is validated before insertion. A monotonic ``sequence`` field
-    is required; updates with a sequence at or below the current
-    high-water mark are rejected.
-    """
+    """Accept a fully validated node-agent batch without sequence poisoning."""
     content_length = request.headers.get("content-length")
     if content_length and int(content_length) > INGEST_MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
@@ -253,103 +349,130 @@ async def node_agent_ingest(request: Request) -> Dict[str, Any]:
     raw = await request.body()
     if len(raw) > INGEST_MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
 
-    import json
+    seq = body.pop("sequence", None)
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise HTTPException(status_code=400, detail="sequence must be an integer")
+    if seq <= 0:
+        raise HTTPException(status_code=400, detail="sequence out of range")
+    if len(body) > INGEST_MAX_ITEMS:
+        raise HTTPException(status_code=400, detail=f"Batch exceeds {INGEST_MAX_ITEMS} items")
+
+    validated: Dict[str, Any] = {}
+    rejected_keys: list[str] = []
+    for key, value in body.items():
+        normalized_key = validate_ingest_key(key)
+        if normalized_key is None:
+            rejected_keys.append(str(key))
+            continue
+        valid, normalized_value = validate_ingest_value(normalized_key, value)
+        if not valid:
+            rejected_keys.append(str(key))
+            continue
+        validated[normalized_key] = normalized_value
+
+    if rejected_keys:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Invalid ingest batch", "rejected": rejected_keys},
+        )
+
+    if not _trusted.commit(seq, validated):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stale sequence {seq}; current high-water mark is {_trusted.sequence}",
+        )
+    return {"accepted": len(validated), "timestamp": time.time()}
+
+
+@app.post("/api/node-agent/tip", dependencies=[Depends(require_node_agent)])
+async def node_agent_push_tip(request: Request) -> Dict[str, Any]:
+    """Accept a validated tip atomically with its monotonic sequence."""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+
+    raw = await request.body()
+    if len(raw) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    seq = body.get("sequence")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise HTTPException(status_code=400, detail="sequence must be an integer")
+    if seq <= 0:
+        raise HTTPException(status_code=400, detail="sequence out of range")
+
+    items: Dict[str, Any] = {}
+    height = body.get("height")
+    block_hash = body.get("hash")
+
+    if height is not None:
+        height = _strict_nonnegative_int(height, "height", maximum=10_000_000)
+        items["tip_height"] = height
+
+    if block_hash is not None:
+        normalized = validate_block_hash_value(block_hash)
+        if normalized is None:
+            raise HTTPException(status_code=400, detail="hash must be exactly 64 hex characters")
+        items["tip_hash"] = normalized
+        if height is not None:
+            items[f"block_height:{height}"] = normalized
+
+    if not items:
+        raise HTTPException(status_code=400, detail="Tip payload contains no chain data")
+
+    if not _trusted.commit(seq, items):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stale sequence {seq}; current high-water mark is {_trusted.sequence}",
+        )
+    return {"accepted": True, "timestamp": time.time()}
+
+
+@app.post("/api/node-agent/deposits", dependencies=[Depends(require_node_agent)])
+async def node_agent_push_deposit(request: Request) -> Dict[str, Any]:
+    """Durably accept a confirmed deposit observation, without crediting balances."""
+    if _deposit_store is None:
+        raise HTTPException(status_code=503, detail="Deposit ingest is not configured")
+
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
+    raw = await request.body()
+    if len(raw) > INGEST_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
     try:
         body = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Body must be a JSON object")
-
-    seq = body.pop("sequence", None)
-    if seq is None:
-        raise HTTPException(status_code=400, detail="Missing required field: sequence")
+    payload = _validate_deposit_payload(body)
     try:
-        seq = int(seq)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="sequence must be an integer")
+        result = _deposit_store.accept(payload)
+    except DepositStoreError as exc:
+        if str(exc) == "deposit_idempotency_conflict":
+            raise HTTPException(status_code=409, detail="Deposit idempotency conflict") from exc
+        raise HTTPException(status_code=500, detail="Deposit persistence failed") from exc
 
-    if not _trusted.advance_sequence(seq):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Stale sequence {seq}; current high-water mark is {_trusted.sequence}",
-        )
-
-    if len(body) > INGEST_MAX_ITEMS:
-        raise HTTPException(status_code=400, detail=f"Batch exceeds {INGEST_MAX_ITEMS} items")
-
-    accepted = 0
-    rejected_keys: list[str] = []
-
-    for key, value in body.items():
-        normalized_key = validate_ingest_key(key)
-        if normalized_key is None:
-            rejected_keys.append(key)
-            continue
-
-        valid, normalized_value = validate_ingest_value(normalized_key, value)
-        if not valid:
-            rejected_keys.append(key)
-            continue
-
-        _trusted.put(normalized_key, normalized_value)
-        accepted += 1
-
-    result: Dict[str, Any] = {"accepted": accepted, "timestamp": time.time()}
-    if rejected_keys:
-        result["rejected"] = rejected_keys
-
-    return result
-
-
-@app.post("/api/node-agent/tip", dependencies=[Depends(require_node_agent)])
-async def node_agent_push_tip(request: Request) -> Dict[str, Any]:
-    """Accept tip height + hash from node agent with sequence enforcement."""
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > INGEST_MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail=f"Body exceeds {INGEST_MAX_BODY_BYTES} bytes")
-
-    body = await request.json()
-
-    seq = body.get("sequence")
-    if seq is None:
-        raise HTTPException(status_code=400, detail="Missing required field: sequence")
-    try:
-        seq = int(seq)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="sequence must be an integer")
-
-    if not _trusted.advance_sequence(seq):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Stale sequence {seq}; current high-water mark is {_trusted.sequence}",
-        )
-
-    height = body.get("height")
-    block_hash = body.get("hash")
-
-    if height is not None:
-        try:
-            height = int(height)
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="height must be an integer")
-        if height < 0 or height > 10_000_000:
-            raise HTTPException(status_code=400, detail="height out of range")
-        _trusted.put("tip_height", height)
-
-    if block_hash is not None:
-        if not isinstance(block_hash, str):
-            raise HTTPException(status_code=400, detail="hash must be a string")
-        normalized = validate_block_hash_value(block_hash)
-        if normalized is None:
-            raise HTTPException(status_code=400, detail="hash must be exactly 64 hex characters")
-        _trusted.put("tip_hash", normalized)
-        if height is not None:
-            _trusted.put(f"block_height:{height}", normalized)
-
-    return {"accepted": True, "timestamp": time.time()}
+    return {
+        "accepted": True,
+        "status": result.status,
+        "idempotency_key": result.idempotency_key,
+        "received_at": result.received_at,
+        "credit_applied": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +527,11 @@ async def health() -> Dict[str, Any]:
             "entries": _cache.size,
             "max_entries": CACHE_MAX_ENTRIES,
             "ttl_seconds": CACHE_TTL,
+        },
+        "deposit_ingest": {
+            "configured": _deposit_store is not None,
+            "accepted_events": _deposit_store.count() if _deposit_store is not None else 0,
+            "credit_enabled": False,
         },
     }
 
