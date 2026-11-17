@@ -28,11 +28,19 @@ class DepositAcceptResult:
 
 
 class DepositStore:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        network: str = "main",
+        genesis_hash: str = MAINNET_GENESIS_HASH,
+    ) -> None:
         path = Path(db_path)
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = str(path)
+        self.network = str(network)
+        self.genesis_hash = str(genesis_hash).lower()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -67,8 +75,40 @@ class DepositStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_btc_deposit_received
                     ON btc_deposit_events(received_at);
+                CREATE TABLE IF NOT EXISTS btc_deposit_store_identity (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    network TEXT NOT NULL,
+                    genesis_hash TEXT NOT NULL,
+                    bound_at INTEGER NOT NULL
+                );
                 """
             )
+            con.execute("BEGIN IMMEDIATE")
+            identity = con.execute(
+                """SELECT network, genesis_hash FROM btc_deposit_store_identity
+                   WHERE singleton=1"""
+            ).fetchone()
+            if identity is not None:
+                if (
+                    str(identity["network"]) != self.network
+                    or str(identity["genesis_hash"]).lower() != self.genesis_hash
+                ):
+                    raise DepositStoreError("deposit_store_network_identity_mismatch")
+            else:
+                incompatible = con.execute(
+                    """SELECT 1 FROM btc_deposit_events
+                       WHERE network<>? OR lower(genesis_hash)<>?
+                       LIMIT 1""",
+                    (self.network, self.genesis_hash),
+                ).fetchone()
+                if incompatible is not None:
+                    raise DepositStoreError("deposit_store_network_identity_mismatch")
+                con.execute(
+                    """INSERT INTO btc_deposit_store_identity
+                       (singleton, network, genesis_hash, bound_at)
+                       VALUES(1,?,?,?)""",
+                    (self.network, self.genesis_hash, int(time.time())),
+                )
 
     @staticmethod
     def canonical_payload(payload: Mapping[str, Any]) -> tuple[str, str]:
@@ -82,16 +122,37 @@ class DepositStore:
         return encoded, digest
 
     def accept(self, payload: Mapping[str, Any]) -> DepositAcceptResult:
+        if (
+            str(payload["network"]) != self.network
+            or str(payload["genesis_hash"]).lower() != self.genesis_hash
+        ):
+            raise DepositStoreError("deposit_store_network_identity_mismatch")
         key = str(payload["idempotency_key"])
         encoded, digest = self.canonical_payload(payload)
         now = int(time.time())
         with self._connect() as con:
+            # Serialize the read/insert decision across processes and replicas
+            # sharing this SQLite file. This makes a lost-response retry and
+            # simultaneous delivery take the same deterministic path.
+            con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT payload_sha256, received_at FROM btc_deposit_events WHERE idempotency_key=?",
-                (key,),
+                """SELECT idempotency_key, payload_sha256, received_at
+                   FROM btc_deposit_events
+                   WHERE idempotency_key=?
+                      OR (network=? AND txid=? AND vout=?)
+                   LIMIT 1""",
+                (
+                    key,
+                    str(payload["network"]),
+                    str(payload["txid"]),
+                    int(payload["vout"]),
+                ),
             ).fetchone()
             if row:
-                if str(row["payload_sha256"]) != digest:
+                if (
+                    str(row["idempotency_key"]) != key
+                    or str(row["payload_sha256"]) != digest
+                ):
                     raise DepositStoreError("deposit_idempotency_conflict")
                 return DepositAcceptResult(
                     status="duplicate",
@@ -99,32 +160,61 @@ class DepositStore:
                     received_at=int(row["received_at"]),
                 )
 
-            con.execute(
-                """INSERT INTO btc_deposit_events
-                   (idempotency_key, network, genesis_hash, event_id, txid, vout,
-                    address, owner_ref, amount_sats, confirmations,
-                    minimum_confirmations, block_hash, block_height,
-                    payload_sha256, payload_json, received_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    key,
-                    str(payload["network"]),
-                    str(payload["genesis_hash"]),
-                    str(payload["event_id"]),
-                    str(payload["txid"]),
-                    int(payload["vout"]),
-                    str(payload["address"]),
-                    str(payload["owner_ref"]),
-                    int(payload["amount_sats"]),
-                    int(payload["confirmations"]),
-                    int(payload["minimum_confirmations"]),
-                    str(payload["block_hash"]),
-                    int(payload["block_height"]),
-                    digest,
-                    encoded,
-                    now,
-                ),
-            )
+            try:
+                con.execute(
+                    """INSERT INTO btc_deposit_events
+                       (idempotency_key, network, genesis_hash, event_id, txid, vout,
+                        address, owner_ref, amount_sats, confirmations,
+                        minimum_confirmations, block_hash, block_height,
+                        payload_sha256, payload_json, received_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        key,
+                        str(payload["network"]),
+                        str(payload["genesis_hash"]),
+                        str(payload["event_id"]),
+                        str(payload["txid"]),
+                        int(payload["vout"]),
+                        str(payload["address"]),
+                        str(payload["owner_ref"]),
+                        int(payload["amount_sats"]),
+                        int(payload["confirmations"]),
+                        int(payload["minimum_confirmations"]),
+                        str(payload["block_hash"]),
+                        int(payload["block_height"]),
+                        digest,
+                        encoded,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # Covers rolling upgrades or any writer not using the same
+                # transaction protocol. Never turn a uniqueness race into an
+                # ambiguous 500 response.
+                row = con.execute(
+                    """SELECT idempotency_key, payload_sha256, received_at
+                       FROM btc_deposit_events
+                       WHERE idempotency_key=?
+                          OR (network=? AND txid=? AND vout=?)
+                       LIMIT 1""",
+                    (
+                        key,
+                        str(payload["network"]),
+                        str(payload["txid"]),
+                        int(payload["vout"]),
+                    ),
+                ).fetchone()
+                if (
+                    row is not None
+                    and str(row["idempotency_key"]) == key
+                    and str(row["payload_sha256"]) == digest
+                ):
+                    return DepositAcceptResult(
+                        status="duplicate",
+                        idempotency_key=key,
+                        received_at=int(row["received_at"]),
+                    )
+                raise DepositStoreError("deposit_idempotency_conflict") from exc
         return DepositAcceptResult(
             status="accepted",
             idempotency_key=key,

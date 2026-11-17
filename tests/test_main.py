@@ -135,6 +135,25 @@ async def test_node_agent_tip_requires_auth(transport):
     assert resp.status_code == 401
 
 
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_deposit_missing_hash_fields_returns_400_not_500(transport):
+    headers = {"X-Node-Agent-Token": "test-secret-token"}
+    original = main_module._deposit_store
+    with tempfile.TemporaryDirectory() as td:
+        main_module._deposit_store = DepositStore(str(Path(td) / "deposits.db"))
+        try:
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/node-agent/deposits",
+                    json={"network": "main"},
+                    headers=headers,
+                )
+        finally:
+            main_module._deposit_store = original
+    assert resp.status_code == 400
+
+
 # ---------- Node agent ingest schema ----------
 
 
@@ -669,6 +688,24 @@ async def test_deposit_ingest_rejects_nonfinal_and_network_mismatch(transport, m
             wrong_network["network"] = "test"
             resp = await ac.post("/api/node-agent/deposits", json=wrong_network, headers=headers)
             assert resp.status_code == 400
+        assert store.count() == 0
+
+
+@pytest.mark.anyio
+@patch("main.NODE_AGENT_TOKEN", "test-secret-token")
+async def test_deposit_cannot_lower_server_confirmation_policy(transport, monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        store = DepositStore(str(Path(td) / "deposits.db"))
+        monkeypatch.setattr(main_module, "_deposit_store", store)
+        payload = _deposit_payload()
+        payload["minimum_confirmations"] = 1
+        payload["confirmations"] = 1
+        headers = {"X-Node-Agent-Token": "test-secret-token"}
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/node-agent/deposits", json=payload, headers=headers
+            )
+        assert resp.status_code == 409
         assert store.count() == 0
 
 

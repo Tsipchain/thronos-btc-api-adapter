@@ -41,9 +41,9 @@ def validate_block_hash(block_hash: str) -> str:
     return block_hash.lower()
 
 
-def validate_block_hash_value(block_hash: str) -> Optional[str]:
+def validate_block_hash_value(block_hash: Any) -> Optional[str]:
     """Non-raising validator for ingest payloads. Returns normalized hash or None."""
-    if not _HEX64.match(block_hash):
+    if not isinstance(block_hash, str) or not _HEX64.match(block_hash):
         return None
     return block_hash.lower()
 

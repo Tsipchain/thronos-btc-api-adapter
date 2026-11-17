@@ -68,6 +68,14 @@ equivalent routes of the Blockstream API:
 | `RATE_LIMIT_RPS` | Maximum number of requests per second to send to upstreams.  0 disables rate limiting. | `5` |
 | `HOST` | Network interface to bind. | `0.0.0.0` |
 | `PORT` | Port to listen on. | `8000` |
+| `NODE_AGENT_TOKEN` | Shared node-agent authentication token. Empty fails closed. | none |
+| `BTC_DEPOSIT_DB_PATH` | SQLite path for durable deposit receipts. Deposit ingest returns 503 when unset. | none |
+| `BTC_DEPOSIT_MIN_CONFIRMATIONS` | Server-side minimum accepted confirmation policy. | `6` |
+
+`BTC_DEPOSIT_DB_PATH` must point inside a persistent volume before deposit
+ingest is enabled. A container-local path is not durable across redeploys and
+must not be used for production receipts. The database is permanently bound to
+Bitcoin mainnet and its genesis hash on first initialization.
 
 ## Running locally
 
