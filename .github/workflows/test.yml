@@ -10,6 +10,7 @@ on:
       - main
       - codex/deposit-store-integrity
       - codex/btc-independent-verifier
+      - codex/btc-settlement-handoff
 
 jobs:
   test:

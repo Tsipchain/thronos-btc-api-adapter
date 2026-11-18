@@ -64,7 +64,10 @@ class FakeRpc:
         raise AssertionError(f"unexpected RPC method {method}")
 
 
-def registry(*, owner_ref=OWNER_REF, script_hex=SCRIPT_HEX, version="registry-v7"):
+def registry(
+    *, owner_ref=OWNER_REF, script_hex=SCRIPT_HEX,
+    version="registry-v7", purpose="bridge_deposit_accounting",
+):
     return WatchRegistry.from_mapping(
         {
             "version": version,
@@ -75,6 +78,7 @@ def registry(*, owner_ref=OWNER_REF, script_hex=SCRIPT_HEX, version="registry-v7
                     "address": ADDRESS,
                     "owner_ref": owner_ref,
                     "script_pubkey_hex": script_hex,
+                    "purpose": purpose,
                     "active": True,
                 }
             ],
@@ -132,6 +136,7 @@ def test_valid_deposit_produces_deterministic_canonical_proof():
     assert proof.amount_sats == 12_345
     assert proof.confirmations == 6
     assert proof.registry_version == "registry-v7"
+    assert proof.purpose == "bridge_deposit_accounting"
     assert proof.verifier_source == "primary"
     assert proof.verified_at == 1_800_000_000
     assert proof.proof_ref.startswith("btcp_")

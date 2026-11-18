@@ -74,6 +74,7 @@ def proof(**changes):
         "tip_hash": TIP_HASH,
         "registry_version": "registry-v7",
         "registry_digest": "55" * 32,
+        "purpose": "bridge_deposit_accounting",
         "verifier_source": "primary",
         "verified_at": 1_800_000_000,
     }
@@ -123,6 +124,11 @@ def test_valid_proof_creates_one_durable_non_delivering_command(stores):
     assert command.idempotency_key == KEY
     assert command.owner_ref == OWNER_REF
     assert command.amount_sats == 12_345
+    assert command.network == "main"
+    assert command.txid == TXID
+    assert command.vout == 0
+    assert command.purpose == "bridge_deposit_accounting"
+    assert command.registry_version == "registry-v7"
     assert command.state == "pending"
     assert handoff.state(KEY)["state"] == SETTLEMENT_PENDING
     assert handoff.pending_commands() == [command]

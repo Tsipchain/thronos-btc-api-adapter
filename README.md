@@ -101,6 +101,7 @@ and binds one address to its intended recipient and exact ScriptPubKey:
       "address": "<watch-only-mainnet-address>",
       "owner_ref": "<bridge-or-earn-intent-id>",
       "script_pubkey_hex": "<exact-lowercase-script-hex>",
+      "purpose": "bridge_deposit_accounting",
       "active": true
     }
   ]
@@ -133,6 +134,11 @@ receipt. `settlement_pending` creates one deterministic command identified by
 same command. Canonical proof is refreshed immediately before first command
 creation so a reorg or reduced confirmation depth blocks the handoff. State
 transitions and their audit records commit atomically.
+
+The registry purpose is restricted to `bridge_pledge_eligibility`,
+`bridge_deposit_accounting`, or `earn_reserve_settlement` and is carried in the
+proof and command with the registry version. Outbound Earn cashouts are not
+accepted by this inbound deposit interface.
 
 The adapter does **not** deliver a command or update a balance. Credit
 acknowledgement is disabled by default and only records a separately produced

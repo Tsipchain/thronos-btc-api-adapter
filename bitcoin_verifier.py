@@ -25,6 +25,13 @@ from deposit_store import MAINNET_GENESIS_HASH
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SCRIPT_HEX = re.compile(r"^(?:[0-9a-f]{2})+$")
 _SATOSHIS_PER_BTC = Decimal("100000000")
+_SETTLEMENT_PURPOSES = frozenset(
+    {
+        "bridge_pledge_eligibility",
+        "bridge_deposit_accounting",
+        "earn_reserve_settlement",
+    }
+)
 
 
 class BitcoinVerificationError(RuntimeError):
@@ -122,6 +129,7 @@ class WatchEntry:
     address: str
     owner_ref: str
     script_pubkey_hex: str
+    purpose: str
 
 
 class WatchRegistry:
@@ -168,12 +176,18 @@ class WatchRegistry:
                 raise VerificationConflict("watch_registry_script_invalid")
             if address in entries:
                 raise VerificationConflict("watch_registry_duplicate_address")
-            entries[address] = WatchEntry(address, owner_ref, script_hex)
+            purpose = _text(
+                row.get("purpose"), "watch_registry_purpose_invalid", 80
+            )
+            if purpose not in _SETTLEMENT_PURPOSES:
+                raise VerificationConflict("watch_registry_purpose_invalid")
+            entries[address] = WatchEntry(address, owner_ref, script_hex, purpose)
             normalized_rows.append(
                 {
                     "address": address,
                     "owner_ref": owner_ref,
                     "script_pubkey_hex": script_hex,
+                    "purpose": purpose,
                 }
             )
         canonical = json.dumps(
@@ -264,6 +278,7 @@ class CanonicalDepositProof:
     tip_hash: str
     registry_version: str
     registry_digest: str
+    purpose: str
     verifier_source: str
     verified_at: int
 
@@ -386,6 +401,7 @@ class IndependentBitcoinVerifier:
             "tip_hash": tip_hash,
             "registry_version": self.registry.version,
             "registry_digest": self.registry.digest,
+            "purpose": watched.purpose,
             "verifier_source": source,
         }
         canonical = json.dumps(proof_payload, sort_keys=True, separators=(",", ":"))
