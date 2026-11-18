@@ -72,6 +72,47 @@ equivalent routes of the Blockstream API:
 | `BTC_DEPOSIT_DB_PATH` | SQLite path for durable deposit receipts. Deposit ingest returns 503 when unset. | none |
 | `BTC_DEPOSIT_MIN_CONFIRMATIONS` | Server-side minimum accepted confirmation policy. | `6` |
 
+### Independent settlement verification boundary
+
+`bitcoin_verifier.py` provides the read-only verification boundary used before
+any future settlement handoff. It does not run automatically, alter receipt
+state, credit a balance, sign a transaction, or broadcast Bitcoin.
+
+The verifier accepts only authenticated Bitcoin Core JSON-RPC evidence. Public
+explorers and node-agent confirmation claims are not authoritative. It checks:
+
+- Bitcoin mainnet and genesis identity;
+- the canonical block hash at the claimed height;
+- exact transaction inclusion, `txid:vout`, ScriptPubKey and integer satoshis;
+- a versioned watch-registry address and intended recipient;
+- at least six confirmations derived from the current trusted Core tip; and
+- canonical membership again immediately before producing proof.
+
+The watch registry is an operator-controlled JSON file. Every entry is active
+and binds one address to its intended recipient and exact ScriptPubKey:
+
+```json
+{
+  "version": "registry-2026-11-18T00:00:00Z",
+  "network": "main",
+  "genesis_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+  "entries": [
+    {
+      "address": "<watch-only-mainnet-address>",
+      "owner_ref": "<bridge-or-earn-intent-id>",
+      "script_pubkey_hex": "<exact-lowercase-script-hex>",
+      "active": true
+    }
+  ]
+}
+```
+
+Primary and archival endpoints must use separate read-only Bitcoin Core RPC
+credentials. The archival endpoint is consulted only when the primary reports
+that historical transaction data is unavailable or pruned. Both endpoints are
+independently checked for mainnet/genesis identity. RPC credentials and private
+keys must never be placed in the registry or proof record.
+
 `BTC_DEPOSIT_DB_PATH` must point inside a persistent volume before deposit
 ingest is enabled. A container-local path is not durable across redeploys and
 must not be used for production receipts. The database is permanently bound to
