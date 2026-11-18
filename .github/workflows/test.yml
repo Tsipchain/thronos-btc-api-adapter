@@ -6,7 +6,10 @@ on:
   pull_request:
     # Phase 4 verifier/handoff PRs are intentionally stacked on the durable
     # receipt-store branch until Draft #5 merges.
-    branches: [main, codex/deposit-store-integrity]
+    branches:
+      - main
+      - codex/deposit-store-integrity
+      - codex/btc-independent-verifier
 
 jobs:
   test:

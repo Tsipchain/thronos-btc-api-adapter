@@ -42,6 +42,8 @@ async def test_health_returns_ok(transport):
     assert "upstreams" in body
     assert "cache" in body
     assert body["cache"]["max_entries"] > 0
+    assert body["deposit_ingest"]["settlement_delivery_enabled"] is False
+    assert body["deposit_ingest"]["credit_enabled"] is False
 
 
 @pytest.mark.anyio
@@ -665,6 +667,8 @@ async def test_deposit_ingest_is_durable_and_idempotent(transport, monkeypatch):
             second = await ac.post("/api/node-agent/deposits", json=_deposit_payload(), headers=headers)
         assert first.status_code == 200
         assert first.json()["status"] == "accepted"
+        assert first.json()["settlement_state"] == "receipt_stored"
+        assert first.json()["settlement_command_created"] is False
         assert first.json()["credit_applied"] is False
         assert second.status_code == 200
         assert second.json()["status"] == "duplicate"
