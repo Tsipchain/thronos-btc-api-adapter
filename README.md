@@ -113,6 +113,34 @@ that historical transaction data is unavailable or pruned. Both endpoints are
 independently checked for mainnet/genesis identity. RPC credentials and private
 keys must never be placed in the registry or proof record.
 
+### Durable settlement handoff
+
+`settlement_handoff.py` persists the non-delivering state machine:
+
+```text
+receipt_stored -> verification_pending -> canonically_verified
+                                      -> settlement_pending
+
+conflict -> quarantine
+reorg before accounting -> reconciliation_required
+credited fixture + reorg -> compensation_pending -> held
+```
+
+Receipt insertion and the initial `receipt_stored` state share one SQLite
+transaction. Canonical proofs are immutable and must exactly match the durable
+receipt. `settlement_pending` creates one deterministic command identified by
+`btc-settle:main:txid:vout`; retries and concurrent preparation return that
+same command. Canonical proof is refreshed immediately before first command
+creation so a reorg or reduced confirmation depth blocks the handoff. State
+transitions and their audit records commit atomically.
+
+The adapter does **not** deliver a command or update a balance. Credit
+acknowledgement is disabled by default and only records a separately produced
+accounting receipt; it never applies the credit itself. A downstream accounting
+service must atomically consume the command into its own inbox, ledger and audit
+tables before returning that receipt. Production must keep acknowledgement
+disabled until that consumer and its authentication are separately approved.
+
 `BTC_DEPOSIT_DB_PATH` must point inside a persistent volume before deposit
 ingest is enabled. A container-local path is not durable across redeploys and
 must not be used for production receipts. The database is permanently bound to

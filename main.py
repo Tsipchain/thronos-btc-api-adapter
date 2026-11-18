@@ -481,6 +481,8 @@ async def node_agent_push_deposit(request: Request) -> Dict[str, Any]:
         "status": result.status,
         "idempotency_key": result.idempotency_key,
         "received_at": result.received_at,
+        "settlement_state": "receipt_stored",
+        "settlement_command_created": False,
         "credit_applied": False,
     }
 
@@ -541,6 +543,7 @@ async def health() -> Dict[str, Any]:
         "deposit_ingest": {
             "configured": _deposit_store is not None,
             "accepted_events": _deposit_store.count() if _deposit_store is not None else 0,
+            "settlement_delivery_enabled": False,
             "credit_enabled": False,
         },
     }

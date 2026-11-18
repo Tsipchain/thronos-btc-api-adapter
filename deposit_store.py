@@ -46,6 +46,7 @@ class DepositStore:
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path, timeout=30)
         con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=FULL")
         return con
@@ -81,6 +82,49 @@ class DepositStore:
                     genesis_hash TEXT NOT NULL,
                     bound_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS btc_settlement_state (
+                    idempotency_key TEXT PRIMARY KEY,
+                    state TEXT NOT NULL CHECK(state IN ('receipt_stored','verification_pending','canonically_verified','settlement_pending','credited','quarantine','reconciliation_required','compensation_pending','held')),
+                    proof_ref TEXT,
+                    proof_json TEXT,
+                    settlement_command_id TEXT UNIQUE,
+                    accounting_receipt_ref TEXT,
+                    last_error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(idempotency_key)
+                        REFERENCES btc_deposit_events(idempotency_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_btc_settlement_state
+                    ON btc_settlement_state(state, updated_at);
+                CREATE TABLE IF NOT EXISTS btc_settlement_commands (
+                    command_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    event_id TEXT NOT NULL,
+                    owner_ref TEXT NOT NULL,
+                    amount_sats INTEGER NOT NULL,
+                    proof_ref TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending','acknowledged','held')),
+                    created_at INTEGER NOT NULL,
+                    acknowledged_at INTEGER,
+                    FOREIGN KEY(idempotency_key)
+                        REFERENCES btc_settlement_state(idempotency_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_btc_settlement_commands_state
+                    ON btc_settlement_commands(state, created_at);
+                CREATE TABLE IF NOT EXISTS btc_settlement_audit (
+                    audit_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_ref TEXT NOT NULL,
+                    from_state TEXT,
+                    to_state TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    UNIQUE(idempotency_key, event_type, event_ref)
+                );
                 """
             )
             con.execute("BEGIN IMMEDIATE")
@@ -109,6 +153,23 @@ class DepositStore:
                        VALUES(1,?,?,?)""",
                     (self.network, self.genesis_hash, int(time.time())),
                 )
+            now = int(time.time())
+            con.execute(
+                """INSERT OR IGNORE INTO btc_settlement_state
+                   (idempotency_key, state, created_at, updated_at)
+                   SELECT idempotency_key, 'receipt_stored', received_at, ?
+                     FROM btc_deposit_events""",
+                (now,),
+            )
+            con.execute(
+                """INSERT OR IGNORE INTO btc_settlement_audit
+                   (audit_id, idempotency_key, event_type, event_ref, from_state,
+                    to_state, details_json, recorded_at)
+                   SELECT 'bsa_receipt:' || idempotency_key, idempotency_key,
+                          'receipt_stored', idempotency_key, NULL,
+                          'receipt_stored', '{}', received_at
+                     FROM btc_deposit_events"""
+            )
 
     @staticmethod
     def canonical_payload(payload: Mapping[str, Any]) -> tuple[str, str]:
@@ -154,6 +215,7 @@ class DepositStore:
                     or str(row["payload_sha256"]) != digest
                 ):
                     raise DepositStoreError("deposit_idempotency_conflict")
+                _register_settlement_receipt(con, key, int(row["received_at"]))
                 return DepositAcceptResult(
                     status="duplicate",
                     idempotency_key=key,
@@ -187,6 +249,7 @@ class DepositStore:
                         now,
                     ),
                 )
+                _register_settlement_receipt(con, key, now)
             except sqlite3.IntegrityError as exc:
                 # Covers rolling upgrades or any writer not using the same
                 # transaction protocol. Never turn a uniqueness race into an
@@ -225,3 +288,26 @@ class DepositStore:
         with self._connect() as con:
             row = con.execute("SELECT COUNT(*) AS n FROM btc_deposit_events").fetchone()
         return int(row["n"])
+
+
+def _register_settlement_receipt(
+    con: sqlite3.Connection, idempotency_key: str, received_at: int
+) -> None:
+    inserted = con.execute(
+        """INSERT OR IGNORE INTO btc_settlement_state
+           (idempotency_key, state, created_at, updated_at)
+           VALUES (?, 'receipt_stored', ?, ?)""",
+        (idempotency_key, received_at, received_at),
+    )
+    if inserted.rowcount != 1:
+        return
+    audit_id = "bsa_" + hashlib.sha256(
+        f"receipt_stored:{idempotency_key}".encode()
+    ).hexdigest()[:24]
+    con.execute(
+        """INSERT OR IGNORE INTO btc_settlement_audit
+           (audit_id, idempotency_key, event_type, event_ref, from_state,
+            to_state, details_json, recorded_at)
+           VALUES (?,?,'receipt_stored',?,NULL,'receipt_stored','{}',?)""",
+        (audit_id, idempotency_key, idempotency_key, received_at),
+    )
