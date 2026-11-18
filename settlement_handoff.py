@@ -58,9 +58,14 @@ class SettlementCommand:
     command_id: str
     idempotency_key: str
     event_id: str
+    network: str
+    txid: str
+    vout: int
     owner_ref: str
     amount_sats: int
     proof_ref: str
+    purpose: str
+    registry_version: str
     payload_sha256: str
     state: str
     created_at: int
@@ -346,14 +351,25 @@ class SettlementHandoffStore:
                 return _command_from_row(_command_in_tx(con, command_id))
             if row["state"] != CANONICALLY_VERIFIED or not row["proof_ref"]:
                 raise SettlementHandoffError("settlement_not_canonically_verified")
+            try:
+                proof_record = json.loads(str(row["proof_json"]))
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise SettlementHandoffError("settlement_proof_record_invalid") from exc
             payload = {
                 "command_id": command_id,
                 "idempotency_key": idempotency_key,
                 "event_id": receipt["event_id"],
+                "network": receipt["network"],
+                "txid": receipt["txid"],
+                "vout": int(receipt["vout"]),
                 "owner_ref": receipt["owner_ref"],
                 "amount_sats": int(receipt["amount_sats"]),
                 "proof_ref": row["proof_ref"],
+                "purpose": proof_record.get("purpose"),
+                "registry_version": proof_record.get("registry_version"),
             }
+            if not payload["purpose"] or not payload["registry_version"]:
+                raise SettlementHandoffError("settlement_proof_contract_incomplete")
             encoded = _canonical_json(payload)
             digest = hashlib.sha256(encoded.encode()).hexdigest()
             con.execute(
@@ -574,13 +590,22 @@ def _proof_matches_receipt(receipt: sqlite3.Row, proof: Mapping[str, Any]) -> No
 
 
 def _command_from_row(row: sqlite3.Row) -> SettlementCommand:
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        raise SettlementHandoffError("settlement_command_payload_invalid") from exc
     return SettlementCommand(
         command_id=str(row["command_id"]),
         idempotency_key=str(row["idempotency_key"]),
         event_id=str(row["event_id"]),
+        network=str(payload["network"]),
+        txid=str(payload["txid"]),
+        vout=int(payload["vout"]),
         owner_ref=str(row["owner_ref"]),
         amount_sats=int(row["amount_sats"]),
         proof_ref=str(row["proof_ref"]),
+        purpose=str(payload["purpose"]),
+        registry_version=str(payload["registry_version"]),
         payload_sha256=str(row["payload_sha256"]),
         state=str(row["state"]),
         created_at=int(row["created_at"]),
