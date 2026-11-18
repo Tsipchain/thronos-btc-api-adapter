@@ -4,7 +4,9 @@ on:
   push:
     branches: [main, 'claude/**']
   pull_request:
-    branches: [main]
+    # Phase 4 verifier/handoff PRs are intentionally stacked on the durable
+    # receipt-store branch until Draft #5 merges.
+    branches: [main, codex/deposit-store-integrity]
 
 jobs:
   test:
